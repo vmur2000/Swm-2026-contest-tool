@@ -1962,3 +1962,182 @@ def log_scoreboard(date_str, temp_df, actuals):
         changed = True
     if changed:
         _save_scoreboard(entries)
+
+
+def _scoreboard_tally(entries):
+    ecmwf_wins = other_wins = ties = 0
+    for e in entries:
+        d = abs(e["ecmwf_err"]) - abs(e["other_err"])
+        if d < -0.05:
+            ecmwf_wins += 1
+        elif d > 0.05:
+            other_wins += 1
+        else:
+            ties += 1
+    return ecmwf_wins, other_wins, ties
+
+
+def print_scoreboard(stations=None):
+    """Print the full day-by-day ECMWF-vs-other-models log + tally. Call directly
+    in a cell:  print_scoreboard()  or  print_scoreboard(["Meenambakkam"])"""
+    entries = _load_scoreboard()
+    if stations:
+        entries = [e for e in entries if e["station"] in stations]
+    if not entries:
+        print("No scoreboard entries yet.")
+        return
+    entries.sort(key=lambda e: (e["station"], e["date"]))
+    print(f"{'Date':<12}{'Station':<16}{'ecmwf':>7}{'other':>7}{'actual':>8}"
+         f"{'ecmwf_err':>11}{'other_err':>11}  winner")
+    for e in entries:
+        d = abs(e["ecmwf_err"]) - abs(e["other_err"])
+        w = "ecmwf" if d < -0.05 else "other" if d > 0.05 else "tie"
+        print(f"{e['date']:<12}{e['station']:<16}{e['ecmwf']:>7.1f}{e['other_mean']:>7.1f}"
+             f"{e['actual']:>8.1f}{e['ecmwf_err']:>+11.1f}{e['other_err']:>+11.1f}  {w}")
+    ew, ow, tw = _scoreboard_tally(entries)
+    print(f"\nTally: ECMWF closer {ew}x, other-models-mean closer {ow}x, tie {tw}x (n={len(entries)})")
+
+
+def scoreboard_summary_html(stations=None, label="Chennai (Meena/Nunga)"):
+    """Short guidance-panel line: running win/loss tally, pointer to the full log."""
+    entries = _load_scoreboard()
+    if stations:
+        entries = [e for e in entries if e["station"] in stations]
+    if not entries:
+        return ""
+    ew, ow, tw = _scoreboard_tally(entries)
+    return (f'<div class="g-label">ECMWF scoreboard &ndash; {label}</div>'
+           f'<div class="g-body">ECMWF closer <b>{ew}x</b> &middot; '
+           f'other-models-mean closer <b>{ow}x</b> &middot; tie {tw}x (n={len(entries)}) '
+           f'<span style="color:#9aa3ad">&middot; print_scoreboard() for the day-by-day log</span></div>')
+
+
+if __name__ == "__main__":
+    mount_drive()
+    live_date = datetime.now(ZoneInfo(TIMEZONE)).date() + timedelta(days=DAY_OFFSET)
+    run_info = fetch_run_info()
+
+    # Detect the 850hPa surge regime for surge-conditional stations (Avalanche,
+    # Chinnakallar) so their bias factor flips with the synoptic state today.
+    # (compute_surge_states logs the decision itself when VERBOSE; the regime also
+    # appears in the report's guidance panel.)
+    surge_states = compute_surge_states({**STATIONS, **TN_RAIN_STATIONS}, live_date)
+
+    rain_df, win = build_table(fetch(STATIONS, "precipitation"),
+                               STATIONS, "precipitation", "sum", live_date,
+                               surge_states=surge_states)
+    tn_df, _ = build_table(fetch(TN_RAIN_STATIONS, "precipitation"),
+                           TN_RAIN_STATIONS, "precipitation", "sum", live_date,
+                           surge_states=surge_states)
+    imd_rain_df, _ = build_table(fetch(IMD_TN_STATIONS, "precipitation"),
+                                 IMD_TN_STATIONS, "precipitation", "sum", live_date)
+    try:
+        live_sea_breeze = compute_sea_breeze(fetch_wind(TEMP_STATIONS), TEMP_STATIONS, live_date)
+    except Exception as e:
+        print(f"Live sea breeze fetch failed ({type(e).__name__}); using climatological fallback.")
+        live_sea_breeze = None
+    temp_df = build_temp_table(fetch_daily_temp(TEMP_STATIONS), TEMP_STATIONS,
+                               live_date, bias=TEMP_BIAS, rank=TEMP_RANK,
+                               sea_breeze=live_sea_breeze)
+    bias_tag = f", +{TEMP_BIAS}" if TEMP_BIAS else ""
+    if _temp_ecmwf_excluded():
+        bias_tag += f", ecmwf excluded until {TEMP_EXCLUDE_ECMWF_UNTIL}"
+
+    # Day-over-day delta: compare each station's forecast to yesterday's
+    # frozen forecast for its own contest window (tracks surge movement,
+    # not accuracy). Silently skipped (all '-') if no prior-day snapshot exists.
+    prev_date_str = (live_date - timedelta(days=1)).isoformat()
+    prev_frozen = load_frozen(prev_date_str)
+    prev_tables = prev_frozen[1] if prev_frozen else {}
+    rain_value_col = "corr" if "corr" in rain_df.columns else RAIN_RANK
+    tn_value_col = "corr" if "corr" in tn_df.columns else RAIN_RANK
+    rain_df = add_delta_column(rain_df, rain_value_col, prev_tables.get("rainfall"), "rain")
+    tn_df = add_delta_column(tn_df, tn_value_col, prev_tables.get("tn_rainfall"), "rain")
+    temp_df = add_delta_column(temp_df, TEMP_RANK, prev_tables.get("temp"), "temp")
+
+    sections = [("Rainfall (mm)", rain_df, "rain"),
+                ("TN rainfall (mm)", tn_df, "rain"),
+                (f"Max temp (\u00b0C, daily max, rank={TEMP_RANK}{bias_tag})", temp_df, "temp")]
+
+    # Freeze the live forecast you're picking from (last run before deadline wins).
+    if FREEZE_FORECAST:
+        try:
+            freeze_snapshot(live_date.isoformat(), run_info, win,
+                            {"rainfall": rain_df, "tn_rainfall": tn_df, "temp": temp_df,
+                             "imd_rain": imd_rain_df})
+        except Exception as e:
+            print(f"Freeze skipped: {type(e).__name__}")
+
+    bt_used = None
+    if BACKTEST_DATE:
+        try:
+            bt_date = datetime.fromisoformat(BACKTEST_DATE).date()
+            frozen = load_frozen(BACKTEST_DATE)
+            if frozen:
+                payload, ft = frozen
+                br, bt, bp = ft["rainfall"], ft["tn_rainfall"], ft["temp"]
+                bw = payload.get("window", BACKTEST_DATE)
+                src = f"FROZEN run, gfs {payload['runs'].get('gfs', '?')}"
+            else:
+                br, bw = build_table(fetch_historical(STATIONS, "precipitation", BACKTEST_DATE),
+                                     STATIONS, "precipitation", "sum", bt_date)
+                bt, _ = build_table(fetch_historical(TN_RAIN_STATIONS, "precipitation", BACKTEST_DATE),
+                                    TN_RAIN_STATIONS, "precipitation", "sum", bt_date)
+                try:
+                    bt_sea_breeze = compute_sea_breeze(
+                        fetch_wind(TEMP_STATIONS, historical=True, date_str=BACKTEST_DATE),
+                        TEMP_STATIONS, bt_date)
+                except Exception as e:
+                    print(f"Backtest sea breeze fetch failed ({type(e).__name__}); using fallback.")
+                    bt_sea_breeze = None
+                bp = build_temp_table(
+                    fetch_daily_temp(TEMP_STATIONS, historical=True, date_str=BACKTEST_DATE),
+                    TEMP_STATIONS, bt_date, bias=TEMP_BIAS, rank=TEMP_RANK,
+                    sea_breeze=bt_sea_breeze)
+                src = "Historical API (no frozen run saved for this date)"
+            sections += [(f"Backtest rainfall ({src}) &mdash; {bw}", br, "rain"),
+                         ("Backtest TN rainfall", bt, "rain"),
+                         (f"Backtest max temp (\u00b0C, rank={TEMP_RANK}{bias_tag})", bp, "temp")]
+            bt_used = BACKTEST_DATE
+            log_scoreboard(BACKTEST_DATE, bp, ACTUALS)   # observation log, independent of REFINE_BIAS
+            if REFINE_BIAS:
+                refine_temp_bias(bp, ACTUALS, source=src)
+                # classify the BACKTEST day's regime (historical 850) so surge
+                # stations learn the right sub-factor.
+                bt_surge = compute_surge_states({**STATIONS, **TN_RAIN_STATIONS},
+                                                bt_date, historical=True)
+                refine_rain_bias(pd.concat([br, bt], ignore_index=True), RAIN_ACTUALS,
+                                 source=src, surge_states=bt_surge)
+        except Exception as e:
+            print(f"Backtest skipped for {BACKTEST_DATE}: {type(e).__name__} "
+                  f"(no frozen run and archive may not have it yet; try a day earlier).")
+
+    chennai_rain_prob = CHENNAI_RAIN_PROB_MANUAL
+    if _chennai_rain_analyze is not None:
+        try:
+            chennai_rain_prob = _chennai_rain_analyze().get("final_pop")
+        except Exception as e:
+            print(f"Live Chennai rain probability fetch failed ({type(e).__name__}); "
+                  f"falling back to manual value.")
+
+    avalanche_surge = analyze_avalanche_surge(live_date)
+
+    banner_html = surge_movement_banner_html(surge_movement(live_date))
+
+    guidance_html = build_guidance_html(temp_df, tn_df, rain_df, chennai_rain_prob=chennai_rain_prob,
+                                        imd_rain_df=imd_rain_df, avalanche_surge=avalanche_surge,
+                                        surge_states=surge_states,
+                                        extra_html=scoreboard_summary_html(SCOREBOARD_STATIONS))
+    html = build_report(run_info, win, sections, bt_used, guidance_html=guidance_html,
+                        banner_html=banner_html)
+
+    with open(OUTFILE, "w") as f:
+        f.write("<!doctype html><meta name='viewport' "
+                "content='width=device-width,initial-scale=1'>" + html)
+    _log(f"Saved {OUTFILE} (open from the Colab Files panel on the left).")
+
+    try:
+        from IPython.display import HTML, display
+        display(HTML(html))
+    except Exception:
+        print("Open the saved HTML file to view the tables.")
