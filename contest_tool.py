@@ -92,6 +92,15 @@ TEMP_STATIONS = {
 }
 
 MODELS = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
+# NOTE (reverted): "ecmwf_aifs025" was added here briefly to bring AIFS (ECMWF's
+# real graph-neural-network model) into the ensemble, but it doesn't work on
+# this general multi-model /v1/forecast endpoint - confirmed empirically
+# (06-Jul run: the aifs column came back all-empty, and its meta.json lookup
+# silently matched some unrelated static archive instead of erroring, showing
+# a run from Feb 2025). AIFS is actually served through ECMWF's SEPARATE
+# /v1/ecmwf endpoint, not this shared one. Adding it properly means a second,
+# independent fetch call merged into the tables - real feature, more plumbing,
+# not a one-line change. Worth doing right rather than half-wired again.
 
 # -- IMD TN/Puducherry/Karaikal bulletin stations: name -> (lat, lon) ---------
 # Matches the 30-station "MAXIMUM TEMP" bulletin table (mausam.imd.gov.in) so
@@ -422,10 +431,21 @@ TEMP_RANK    = "score"  # rank temp table by: "score" (mean adjusted for model s
 # model-spread issue not a station one. CAUTION: Vellore ran 2.8 below its OWN
 # normal max today (cloud/rain anomaly, not a warm-bias), so its 1.5->0.9 pull
 # is the least-trustworthy move here - half-step it if it whipsaws.
+# 07-Jul-2026 (1730 IST IMD obs vs that morning's live 'score' forecast, EMA
+# alpha=0.3). Madurai/Tiruchi/Tiruttani/Cuddalore/Vellore had all drifted too
+# WARM (overshooting actuals by 0.9-1.7 deg after several up-only EMA passes
+# chasing earlier cold-bias days) and got pulled back down. Chennai stations
+# + Nagapattinam + Palayamkottai were all within +0.3 (essentially spot-on,
+# tiny nudge up). Tondi's residual (+2.1) was NOT applied to its base bias
+# here - that miss traces to the late (16:00 IST) sea-breeze onset not
+# triggering the no-breeze bump at all (binary check), not to a wrong base
+# bias. Folding the full +2.1 into Tondi's flat bias would double-count once
+# the graded late-breeze bump below is applied, and would wrongly inflate
+# Tondi's forecast on a normal-onset day. See _seabreeze_lateness_bump().
 STATION_TEMP_BIAS = {
-    "Tiruchi": 1.9, "Madurai": 3.6, "Palayamkottai": 1.1, "Meenambakkam": 0.1,
-    "Tiruttani": 1.5, "Vellore": 0.9, "Cuddalore": 2.6, "Tondi": 0.4,
-    "Nungambakkam": 0.0, "Nagapattinam": 1.6,
+    "Tiruchi": 1.5, "Madurai": 3.1, "Palayamkottai": 1.2, "Meenambakkam": 0.2,
+    "Tiruttani": 1.1, "Vellore": 0.6, "Cuddalore": 2.3, "Tondi": 0.4,
+    "Nungambakkam": 0.1, "Nagapattinam": 1.7,
 }
 TEMP_LEARN_RATE = 0.3   # how fast STATION_TEMP_BIAS adapts per day (EMA); lower = smoother
 
@@ -439,9 +459,7 @@ TEMP_LEARN_RATE = 0.3   # how fast STATION_TEMP_BIAS adapts per day (EMA); lower
 # NOTE: applies to TEMP only. Rain corr stays ECMWF-based on purpose - the
 # learned rain factors are actual/ECMWF ratios (corr breaks without it), and
 # ECMWF remains the best rain model on surge days (e.g. Tamhini today).
-# RE-ENABLED 06-Jul-2026 (was "2026-07-13"): ECMWF back voting in the temp
-# mean/spread/score. Set back to a date string if the cold skew returns.
-TEMP_EXCLUDE_ECMWF_UNTIL = None
+TEMP_EXCLUDE_ECMWF_UNTIL = "2026-07-13"
 
 
 def _temp_ecmwf_excluded():
@@ -498,10 +516,55 @@ def _no_seabreeze(sb_state):
     """True if the (live-detected) sea-breeze string means no breeze today."""
     return isinstance(sb_state, str) and "No Sea Breeze" in sb_state
 
+
+# --- NEW 07-Jul: graded bump for a LATE (but technically-detected) breeze ----
+# 07-Jul exposed a gap: Tondi's live detector found an onset at 16:00 IST
+# (normal window 11:30-12:00) - a real onset string, so _no_seabreeze() read
+# False and NO_SEABREEZE_TEMP_BUMP never fired, even though a breeze arriving
+# 4+ hours late has almost no time to cap the afternoon max and behaves close
+# to a true no-breeze day (actual ran +2.1 over forecast, vs a full no-breeze
+# station's typical +2.0 net correction). A flat late/on-time cutoff would
+# just move the cliff edge rather than removing it, so this instead RAMPS the
+# bump in proportional to how many hours late the onset is past the station's
+# normal window, capping at the full NO_SEABREEZE_TEMP_BUMP once lateness
+# reaches LATE_BREEZE_FULL_BUMP_HOURS. On-time or early onsets get 0 - normal
+# days are untouched, same as before this fix.
+USE_LATE_SEABREEZE_BUMP = True
+LATE_BREEZE_FULL_BUMP_HOURS = 4.0   # hours past the normal window's end = full bump
+
+
+def _seabreeze_lateness_bump(name, sb_state):
+    """Partial (ramped) bump for an onset that IS detected but arrives late.
+    Returns 0.0 if disabled, if sb_state isn't a real "HH:MM IST" onset string
+    (e.g. it's a no-breeze string or a raw '-'), or if the station has no
+    climatological onset window to compare against (e.g. 'negligible')."""
+    if not (USE_LATE_SEABREEZE_BUMP and isinstance(sb_state, str)
+            and sb_state.endswith("IST") and "No Sea Breeze" not in sb_state):
+        return 0.0
+    normal = SEA_BREEZE_ONSET.get(name)
+    if not normal or "-" not in normal or normal == "negligible":
+        return 0.0
+    try:
+        onset_hm = sb_state.split(" ")[0]
+        onset_dt = datetime.strptime(onset_hm, "%H:%M")
+        window_end_hm = normal.split("-")[1].strip().split(" ")[0]
+        window_end_dt = datetime.strptime(window_end_hm, "%H:%M")
+    except Exception:
+        return 0.0
+    late_hours = (onset_dt - window_end_dt).total_seconds() / 3600.0
+    if late_hours <= 0:
+        return 0.0   # on-time or early - no adjustment
+    frac = min(late_hours / LATE_BREEZE_FULL_BUMP_HOURS, 1.0)
+    return round(frac * NO_SEABREEZE_TEMP_BUMP.get(name, 0.0), 2)
+
+
 # Expected sea breeze onset (local IST), by distance/exposure from the coast.
 # Climatological FALLBACK ONLY - used if the live wind fetch fails. The live
 # path (compute_sea_breeze, wired in __main__) detects the actual daily onset
-# from hourly wind direction/speed and overrides this.
+# from hourly wind direction/speed and overrides this. ALSO used (as of 07-Jul)
+# as the reference "normal window" for _seabreeze_lateness_bump() above, even
+# when the live path succeeds - i.e. it now does double duty as both the
+# fallback value AND the lateness yardstick.
 SEA_BREEZE_ONSET = {
     "Tondi":          "11:30-12:00 IST",  # narrow peninsula, coast on both sides - earliest, strongest
     "Nungambakkam":   "12:00-12:30 IST",  # Chennai, ~2-3 km from coast
@@ -524,15 +587,14 @@ SEABREEZE_SPEED_MIN = 10                            # km/h, min sustained onshor
 SEABREEZE_SEARCH_START, SEABREEZE_SEARCH_END = 9, 19   # IST hour window to search
 # Paste a past day's IMD actual max temps here to get suggested bias updates after the
 # backtest. Leave {} to skip. Station names must match TEMP_STATIONS keys.
-# 04-Jul IMD 1730 IST obs (Madurai = city 36.4; Chennai AP = Meenambakkam 32.4;
-# Chennai Nungambakkam 32.2; Tiruchi = Tiruchirapalli AP 34.7).
-# ALREADY EMA'd into STATION_TEMP_BIAS above (04-Jul pass) - do NOT flip
-# REFINE_BIAS on against THIS day or you'll double-count. Meena/Nunga were held
-# (raw ECMWF nailed both), so they carry no residual to re-apply anyway.
+# 07-Jul IMD 1730 IST obs (Chennai AP = Meenambakkam 39.0; Chennai Nungambakkam
+# 38.9; Tiruchirapalli AP = Tiruchi 38.1; Tiruthani = Tiruttani 38.0). ALREADY
+# EMA'd into STATION_TEMP_BIAS above (07-Jul pass) - do NOT flip REFINE_BIAS on
+# against THIS day or you'll double-count.
 ACTUALS = {
-    "Tiruttani": 35.0, "Tiruchi": 34.7, "Meenambakkam": 32.4, "Nungambakkam": 32.2,
-    "Madurai": 36.4, "Vellore": 32.8, "Nagapattinam": 34.0, "Cuddalore": 33.2,
-    "Palayamkottai": 34.5, "Tondi": 36.2,
+    "Madurai": 38.4, "Tiruchi": 38.1, "Tiruttani": 38.0, "Cuddalore": 38.3,
+    "Nagapattinam": 39.2, "Meenambakkam": 39.0, "Nungambakkam": 38.9,
+    "Vellore": 37.4, "Tondi": 40.3, "Palayamkottai": 37.6,
 }
 REFINE_BIAS = False     # print bias-refinement suggestions during the backtest. Keep OFF
                         # for clean output. Turn ON only when re-tuning, and set BACKTEST_DATE
@@ -1208,6 +1270,12 @@ def build_temp_table(data, stations, contest_date, bias=0.0, rank=TEMP_RANK, sea
         sb = STATION_TEMP_BIAS.get(name, 0.0)
         if USE_NO_SEABREEZE_BUMP and _no_seabreeze(sb_state):
             sb += NO_SEABREEZE_TEMP_BUMP.get(name, 0.0)   # hotter when the breeze fails to cap the max
+        else:
+            # NEW 07-Jul: breeze DID arrive but possibly late - ramp a partial
+            # bump in proportional to lateness (see _seabreeze_lateness_bump).
+            # Returns 0.0 for a normal on-time onset, so this is a no-op on
+            # ordinary days.
+            sb += _seabreeze_lateness_bump(name, sb_state)
         row, vals = {"Station": name}, []
         for mdl in MODELS:
             label = LABELS.get(mdl, mdl)
@@ -1700,7 +1768,9 @@ def build_report(run_info, window_label, sections, bt_date=None, guidance_html=N
                  'sea breeze = live-detected onshore wind flip for that day (falls back to '
                  'climatological estimate if the wind fetch fails) - coastal stations flip '
                  'earliest/strongest, inland stations later/weaker; "No Sea Breeze today" = no '
-                 'qualifying onshore flip detected that day. '
+                 'qualifying onshore flip detected that day. A LATE onset (still detected, just '
+                 'past the normal window) gets a partial no-breeze bump ramped by how many hours '
+                 'late it is (full bump at 4h+ late). '
                  'delta = change vs yesterday\'s forecast for that station (amber = building, '
                  'blue = fading) - tracks day-over-day forecast movement, not forecast accuracy. '
                  '&ndash; = no data / no prior-day forecast to compare.</div>')
@@ -1754,6 +1824,90 @@ def load_frozen(date_str):
     return payload, tables
 
 
+# --- AIFS via ECMWF's DEDICATED endpoint (isolated test, NOT wired into the ---
+# --- main report yet - run test_aifs() by hand and confirm real numbers    ---
+# --- come back before merging this into build_table()/build_temp_table(). ---
+# Prior attempt failed because "ecmwf_aifs025" isn't served on the shared
+# /v1/forecast endpoint (the one MODELS uses) - AIFS is scoped to ECMWF's own
+# /v1/ecmwf endpoint instead (confirmed via Open-Meteo's docs: that endpoint's
+# model dropdown lists "ECMWF IFS HRES 9km", "ECMWF IFS 0.25 deg", and
+# "ECMWF AIFS 0.25 deg Single"). This fetches from THAT endpoint. Unverified:
+# the exact model= string here is a best-effort match to Open-Meteo's naming
+# convention, not something fetchable/testable from this sandbox (no live
+# network access here beyond pages already linked in conversation) - hence
+# the standalone test function below instead of wiring it in blind again.
+AIFS_ENDPOINT = "https://api.open-meteo.com/v1/ecmwf"
+AIFS_MODEL = "ecmwf_aifs025"
+
+
+def fetch_aifs_precip(stations):
+    """Hourly precipitation from AIFS via ECMWF's dedicated endpoint."""
+    lats = ",".join(str(lat) for lat, lon in stations.values())
+    lons = ",".join(str(lon) for lat, lon in stations.values())
+    params = {"latitude": lats, "longitude": lons, "hourly": "precipitation",
+              "models": AIFS_MODEL, "timezone": TIMEZONE,
+              "forecast_days": max(DAY_OFFSET, 0) + 3, "precipitation_unit": "mm"}
+    r = _get_with_retry(AIFS_ENDPOINT, params=params)
+    data = r.json()
+    return data if isinstance(data, list) else [data]
+
+
+def fetch_aifs_daily_temp(stations):
+    """Daily temperature_2m_max from AIFS via ECMWF's dedicated endpoint."""
+    lats = ",".join(str(lat) for lat, lon in stations.values())
+    lons = ",".join(str(lon) for lat, lon in stations.values())
+    params = {"latitude": lats, "longitude": lons, "daily": "temperature_2m_max",
+              "models": AIFS_MODEL, "timezone": TIMEZONE,
+              "forecast_days": max(DAY_OFFSET, 0) + 3}
+    r = _get_with_retry(AIFS_ENDPOINT, params=params)
+    data = r.json()
+    return data if isinstance(data, list) else [data]
+
+
+def test_aifs(stations=None):
+    """STANDALONE diagnostic - run this alone in a Colab cell:  test_aifs()
+    Prints raw AIFS precipitation + daily max temp for a couple of stations so
+    you can SEE whether real numbers come back before we touch the main report.
+    A working result looks like real mm/degC values with today's date in the
+    time array. A broken result looks like empty lists, all-null values, or an
+    HTTP error printed by _get_with_retry (400 = wrong model/endpoint string,
+    which would mean the endpoint fix still needs adjusting)."""
+    test_stations = stations or {"Mahabaleshwar (MH)": STATIONS["Mahabaleshwar (MH)"],
+                                 "Nungambakkam": TEMP_STATIONS["Nungambakkam"]}
+    print(f"Testing AIFS via {AIFS_ENDPOINT} (models={AIFS_MODEL})\n")
+    try:
+        precip = fetch_aifs_precip(test_stations)
+        for name, loc in zip(test_stations.keys(), precip):
+            h = loc.get("hourly", {})
+            times = h.get("time", [])
+            series = h.get(f"precipitation_{AIFS_MODEL}", h.get("precipitation"))
+            if not times or series is None:
+                print(f"  RAIN  {name}: NO DATA - keys returned: {list(h.keys())}")
+            else:
+                today_vals = series[:24] if series else []
+                print(f"  RAIN  {name}: OK - first day, e.g. {times[0]}={today_vals[0] if today_vals else '?'}, "
+                     f"24h sample sum={sum(v for v in today_vals if v is not None):.1f}mm")
+    except Exception as e:
+        print(f"  RAIN  fetch FAILED: {type(e).__name__}: {e}")
+
+    try:
+        temp = fetch_aifs_daily_temp(test_stations)
+        for name, loc in zip(test_stations.keys(), temp):
+            d = loc.get("daily", {})
+            times = d.get("time", [])
+            series = d.get(f"temperature_2m_max_{AIFS_MODEL}", d.get("temperature_2m_max"))
+            if not times or series is None:
+                print(f"  TEMP  {name}: NO DATA - keys returned: {list(d.keys())}")
+            else:
+                print(f"  TEMP  {name}: OK - {times[0]}={series[0]}\u00b0C ... {times[-1]}={series[-1]}\u00b0C")
+    except Exception as e:
+        print(f"  TEMP  fetch FAILED: {type(e).__name__}: {e}")
+
+    print("\nIf both show OK with sane mm/\u00b0C values dated today or later, AIFS is reachable -"
+         " tell me and I'll wire it into the main tables as a 4th column.")
+    print("If either shows NO DATA or FAILED, paste the output back and we'll adjust the model/endpoint string.")
+
+
 # --- ECMWF-vs-other-models scoreboard ----------------------------------------
 def _scoreboard_path():
     return os.path.join(FROZEN_DIR, SCOREBOARD_FILE_NAME)
@@ -1796,193 +1950,15 @@ def log_scoreboard(date_str, temp_df, actuals):
         other = [v for v in (gfs, icon) if v is not None and not pd.isna(v)]
         if ecmwf is None or pd.isna(ecmwf) or not other:
             continue
-        other_mean = round(sum(other) / len(other), 1)
+        other_mean = sum(other) / len(other)
         actual = actuals[name]
         entries.append({
             "date": date_str, "station": name,
-            "ecmwf": ecmwf, "other_mean": other_mean, "actual": actual,
+            "ecmwf": round(ecmwf, 1), "other_mean": round(other_mean, 1),
+            "actual": round(actual, 1),
             "ecmwf_err": round(ecmwf - actual, 1),
             "other_err": round(other_mean - actual, 1),
         })
         changed = True
     if changed:
         _save_scoreboard(entries)
-
-
-def _scoreboard_tally(entries):
-    ecmwf_wins = other_wins = ties = 0
-    for e in entries:
-        d = abs(e["ecmwf_err"]) - abs(e["other_err"])
-        if d < -0.05:
-            ecmwf_wins += 1
-        elif d > 0.05:
-            other_wins += 1
-        else:
-            ties += 1
-    return ecmwf_wins, other_wins, ties
-
-
-def print_scoreboard(stations=None):
-    """Print the full day-by-day ECMWF-vs-other-models log + tally. Call directly
-    in a cell:  print_scoreboard()  or  print_scoreboard(["Meenambakkam"])"""
-    entries = _load_scoreboard()
-    if stations:
-        entries = [e for e in entries if e["station"] in stations]
-    if not entries:
-        print("No scoreboard entries yet.")
-        return
-    entries.sort(key=lambda e: (e["station"], e["date"]))
-    print(f"{'Date':<12}{'Station':<16}{'ecmwf':>7}{'other':>7}{'actual':>8}"
-         f"{'ecmwf_err':>11}{'other_err':>11}  winner")
-    for e in entries:
-        d = abs(e["ecmwf_err"]) - abs(e["other_err"])
-        w = "ecmwf" if d < -0.05 else "other" if d > 0.05 else "tie"
-        print(f"{e['date']:<12}{e['station']:<16}{e['ecmwf']:>7.1f}{e['other_mean']:>7.1f}"
-             f"{e['actual']:>8.1f}{e['ecmwf_err']:>+11.1f}{e['other_err']:>+11.1f}  {w}")
-    ew, ow, tw = _scoreboard_tally(entries)
-    print(f"\nTally: ECMWF closer {ew}x, other-models-mean closer {ow}x, tie {tw}x (n={len(entries)})")
-
-
-def scoreboard_summary_html(stations=None, label="Chennai (Meena/Nunga)"):
-    """Short guidance-panel line: running win/loss tally, pointer to the full log."""
-    entries = _load_scoreboard()
-    if stations:
-        entries = [e for e in entries if e["station"] in stations]
-    if not entries:
-        return ""
-    ew, ow, tw = _scoreboard_tally(entries)
-    return (f'<div class="g-label">ECMWF scoreboard &ndash; {label}</div>'
-           f'<div class="g-body">ECMWF closer <b>{ew}x</b> &middot; '
-           f'other-models-mean closer <b>{ow}x</b> &middot; tie {tw}x (n={len(entries)}) '
-           f'<span style="color:#9aa3ad">&middot; print_scoreboard() for the day-by-day log</span></div>')
-
-
-if __name__ == "__main__":
-    mount_drive()
-    live_date = datetime.now(ZoneInfo(TIMEZONE)).date() + timedelta(days=DAY_OFFSET)
-    run_info = fetch_run_info()
-
-    # Detect the 850hPa surge regime for surge-conditional stations (Avalanche,
-    # Chinnakallar) so their bias factor flips with the synoptic state today.
-    # (compute_surge_states logs the decision itself when VERBOSE; the regime also
-    # appears in the report's guidance panel.)
-    surge_states = compute_surge_states({**STATIONS, **TN_RAIN_STATIONS}, live_date)
-
-    rain_df, win = build_table(fetch(STATIONS, "precipitation"),
-                               STATIONS, "precipitation", "sum", live_date,
-                               surge_states=surge_states)
-    tn_df, _ = build_table(fetch(TN_RAIN_STATIONS, "precipitation"),
-                           TN_RAIN_STATIONS, "precipitation", "sum", live_date,
-                           surge_states=surge_states)
-    imd_rain_df, _ = build_table(fetch(IMD_TN_STATIONS, "precipitation"),
-                                 IMD_TN_STATIONS, "precipitation", "sum", live_date)
-    try:
-        live_sea_breeze = compute_sea_breeze(fetch_wind(TEMP_STATIONS), TEMP_STATIONS, live_date)
-    except Exception as e:
-        print(f"Live sea breeze fetch failed ({type(e).__name__}); using climatological fallback.")
-        live_sea_breeze = None
-    temp_df = build_temp_table(fetch_daily_temp(TEMP_STATIONS), TEMP_STATIONS,
-                               live_date, bias=TEMP_BIAS, rank=TEMP_RANK,
-                               sea_breeze=live_sea_breeze)
-    bias_tag = f", +{TEMP_BIAS}" if TEMP_BIAS else ""
-    if _temp_ecmwf_excluded():
-        bias_tag += f", ecmwf excluded until {TEMP_EXCLUDE_ECMWF_UNTIL}"
-
-    # Day-over-day delta: compare each station's forecast to yesterday's
-    # frozen forecast for its own contest window (tracks surge movement,
-    # not accuracy). Silently skipped (all '-') if no prior-day snapshot exists.
-    prev_date_str = (live_date - timedelta(days=1)).isoformat()
-    prev_frozen = load_frozen(prev_date_str)
-    prev_tables = prev_frozen[1] if prev_frozen else {}
-    rain_value_col = "corr" if "corr" in rain_df.columns else RAIN_RANK
-    tn_value_col = "corr" if "corr" in tn_df.columns else RAIN_RANK
-    rain_df = add_delta_column(rain_df, rain_value_col, prev_tables.get("rainfall"), "rain")
-    tn_df = add_delta_column(tn_df, tn_value_col, prev_tables.get("tn_rainfall"), "rain")
-    temp_df = add_delta_column(temp_df, TEMP_RANK, prev_tables.get("temp"), "temp")
-
-    sections = [("Rainfall (mm)", rain_df, "rain"),
-                ("TN rainfall (mm)", tn_df, "rain"),
-                (f"Max temp (\u00b0C, daily max, rank={TEMP_RANK}{bias_tag})", temp_df, "temp")]
-
-    # Freeze the live forecast you're picking from (last run before deadline wins).
-    if FREEZE_FORECAST:
-        try:
-            freeze_snapshot(live_date.isoformat(), run_info, win,
-                            {"rainfall": rain_df, "tn_rainfall": tn_df, "temp": temp_df,
-                             "imd_rain": imd_rain_df})
-        except Exception as e:
-            print(f"Freeze skipped: {type(e).__name__}")
-
-    bt_used = None
-    if BACKTEST_DATE:
-        try:
-            bt_date = datetime.fromisoformat(BACKTEST_DATE).date()
-            frozen = load_frozen(BACKTEST_DATE)
-            if frozen:
-                payload, ft = frozen
-                br, bt, bp = ft["rainfall"], ft["tn_rainfall"], ft["temp"]
-                bw = payload.get("window", BACKTEST_DATE)
-                src = f"FROZEN run, gfs {payload['runs'].get('gfs', '?')}"
-            else:
-                br, bw = build_table(fetch_historical(STATIONS, "precipitation", BACKTEST_DATE),
-                                     STATIONS, "precipitation", "sum", bt_date)
-                bt, _ = build_table(fetch_historical(TN_RAIN_STATIONS, "precipitation", BACKTEST_DATE),
-                                    TN_RAIN_STATIONS, "precipitation", "sum", bt_date)
-                try:
-                    bt_sea_breeze = compute_sea_breeze(
-                        fetch_wind(TEMP_STATIONS, historical=True, date_str=BACKTEST_DATE),
-                        TEMP_STATIONS, bt_date)
-                except Exception as e:
-                    print(f"Backtest sea breeze fetch failed ({type(e).__name__}); using fallback.")
-                    bt_sea_breeze = None
-                bp = build_temp_table(
-                    fetch_daily_temp(TEMP_STATIONS, historical=True, date_str=BACKTEST_DATE),
-                    TEMP_STATIONS, bt_date, bias=TEMP_BIAS, rank=TEMP_RANK,
-                    sea_breeze=bt_sea_breeze)
-                src = "Historical API (no frozen run saved for this date)"
-            sections += [(f"Backtest rainfall ({src}) &mdash; {bw}", br, "rain"),
-                         ("Backtest TN rainfall", bt, "rain"),
-                         (f"Backtest max temp (\u00b0C, rank={TEMP_RANK}{bias_tag})", bp, "temp")]
-            bt_used = BACKTEST_DATE
-            log_scoreboard(BACKTEST_DATE, bp, ACTUALS)   # observation log, independent of REFINE_BIAS
-            if REFINE_BIAS:
-                refine_temp_bias(bp, ACTUALS, source=src)
-                # classify the BACKTEST day's regime (historical 850) so surge
-                # stations learn the right sub-factor.
-                bt_surge = compute_surge_states({**STATIONS, **TN_RAIN_STATIONS},
-                                                bt_date, historical=True)
-                refine_rain_bias(pd.concat([br, bt], ignore_index=True), RAIN_ACTUALS,
-                                 source=src, surge_states=bt_surge)
-        except Exception as e:
-            print(f"Backtest skipped for {BACKTEST_DATE}: {type(e).__name__} "
-                  f"(no frozen run and archive may not have it yet; try a day earlier).")
-
-    chennai_rain_prob = CHENNAI_RAIN_PROB_MANUAL
-    if _chennai_rain_analyze is not None:
-        try:
-            chennai_rain_prob = _chennai_rain_analyze().get("final_pop")
-        except Exception as e:
-            print(f"Live Chennai rain probability fetch failed ({type(e).__name__}); "
-                  f"falling back to manual value.")
-
-    avalanche_surge = analyze_avalanche_surge(live_date)
-
-    banner_html = surge_movement_banner_html(surge_movement(live_date))
-
-    guidance_html = build_guidance_html(temp_df, tn_df, rain_df, chennai_rain_prob=chennai_rain_prob,
-                                        imd_rain_df=imd_rain_df, avalanche_surge=avalanche_surge,
-                                        surge_states=surge_states,
-                                        extra_html=scoreboard_summary_html(SCOREBOARD_STATIONS))
-    html = build_report(run_info, win, sections, bt_used, guidance_html=guidance_html,
-                        banner_html=banner_html)
-
-    with open(OUTFILE, "w") as f:
-        f.write("<!doctype html><meta name='viewport' "
-                "content='width=device-width,initial-scale=1'>" + html)
-    _log(f"Saved {OUTFILE} (open from the Colab Files panel on the left).")
-
-    try:
-        from IPython.display import HTML, display
-        display(HTML(html))
-    except Exception:
-        print("Open the saved HTML file to view the tables.")
